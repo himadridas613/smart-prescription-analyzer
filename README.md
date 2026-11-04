@@ -1,3 +1,4 @@
+<<<<<<< HEAD
 # MediScan AI — Smart Prescription Analyzer
 
 An AI-powered healthcare SaaS that reads handwritten and printed prescriptions, extracts
@@ -103,3 +104,7 @@ qualified doctor or pharmacist.
 ## License
 
 [MIT](LICENSE)
+=======
+# smart-prescription-analyzer
+AI-powered Smart Prescription Analyzer built with React, Supabase, PostgreSQL, and Gemini Vision to extract handwritten prescription data, generate intelligent medicine reports, and securely manage healthcare records.
+>>>>>>> 83dcbe90b78c0fc9310ead67b4b21e2d01d63e9f
