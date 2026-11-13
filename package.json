@@ -42,9 +42,9 @@
     "@supabase/supabase-js": "^2.110.8",
     "@tailwindcss/vite": "^4.2.1",
     "@tanstack/react-query": "^5.101.1",
-    "@tanstack/react-router": "1.170.41",
-    "@tanstack/react-start": "1.168.60",
-    "@tanstack/router-plugin": "1.168.42",
+    "@tanstack/react-router": "^1.170.41",
+    "@tanstack/react-start": "^1.170.41",
+    "@tanstack/router-plugin": "^1.170.41",
     "class-variance-authority": "^0.7.1",
     "clsx": "^2.1.1",
     "cmdk": "^1.1.1",
@@ -84,8 +84,8 @@
     "typescript-eslint": "^8.56.1",
     "vite": "^8.0.16"
   },
-  "description": "AI-powered smart prescription analyzer \u2014 OCR for handwritten prescriptions, drug interaction detection, and safety reports.",
+  "description": "AI-powered smart prescription analyzer — OCR for handwritten prescriptions, drug interaction detection, and safety reports.",
   "version": "1.0.0",
   "license": "MIT",
-  "author": "Your Name"
+  "author": "Himadri Das"
 }
