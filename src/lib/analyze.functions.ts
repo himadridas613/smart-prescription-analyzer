@@ -78,56 +78,136 @@ async function setStage(
   await supabase.from("prescriptions").update({ stage }).eq("id", id);
 }
 
-const AI_MODEL = process.env.OPENROUTER_MODEL || "google/gemini-2.5-flash";
+function parseAiJson(raw: string) {
+  const stripped = raw
+    .trim()
+    .replace(/^```(?:json)?/i, "")
+    .replace(/```$/i, "")
+    .trim();
+  const firstBrace = stripped.indexOf("{");
+  const lastBrace = stripped.lastIndexOf("}");
+  const jsonString =
+    firstBrace !== -1 && lastBrace !== -1
+      ? stripped.slice(firstBrace, lastBrace + 1)
+      : stripped;
+  return AnalysisSchema.parse(JSON.parse(jsonString));
+}
+
+// Free OpenRouter vision models tried in order if no paid credits are available
+const FREE_OPENROUTER_MODELS = [
+  "google/gemma-3-27b-it:free",
+  "qwen/qwen2.5-vl-72b-instruct:free",
+  "qwen/qwen2.5-vl-32b-instruct:free",
+  "meta-llama/llama-3.2-11b-vision-instruct:free",
+  "mistralai/mistral-small-3.1-24b-instruct:free",
+];
 
 async function runAnalysis(mime: string, fileName: string | undefined, base64: string) {
-  const apiKey = process.env.OPENROUTER_API_KEY || process.env.VITE_OPENROUTER_API_KEY;
-  if (!apiKey) throw new Error("AI service not configured. Set OPENROUTER_API_KEY in Vercel.");
-
   const isImage = mime.startsWith("image/");
   const isPdf = mime === "application/pdf";
   if (!isImage && !isPdf) throw new Error("Unsupported file type");
 
+  // 1. Optional direct Google Gemini API support (100% free via Google AI Studio key)
+  const geminiKey = process.env.GEMINI_API_KEY || process.env.VITE_GEMINI_API_KEY;
+  if (geminiKey) {
+    const geminiRes = await fetch(
+      `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${geminiKey}`,
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          systemInstruction: { parts: [{ text: SYSTEM_PROMPT }] },
+          contents: [
+            {
+              role: "user",
+              parts: [
+                { text: "Analyze this prescription and return ONLY the JSON object." },
+                { inlineData: { mimeType: mime, data: base64 } },
+              ],
+            },
+          ],
+          generationConfig: { responseMimeType: "application/json" },
+        }),
+      },
+    );
+
+    if (geminiRes.ok) {
+      const geminiJson = (await geminiRes.json()) as any;
+      const rawText = geminiJson.candidates?.[0]?.content?.parts?.[0]?.text ?? "{}";
+      return parseAiJson(rawText);
+    }
+  }
+
+  // 2. OpenRouter API with automatic fallback to :free vision models
+  const apiKey = process.env.OPENROUTER_API_KEY || process.env.VITE_OPENROUTER_API_KEY;
+  if (!apiKey) {
+    throw new Error("AI service not configured. Set OPENROUTER_API_KEY or GEMINI_API_KEY in Vercel.");
+  }
+
   const userContent = isImage
     ? [
-        { type: "text", text: "Analyze this prescription and return the JSON described in the system message." },
+        {
+          type: "text",
+          text: `${SYSTEM_PROMPT}\n\nAnalyze this prescription image and return ONLY the JSON object.`,
+        },
         { type: "image_url", image_url: { url: `data:${mime};base64,${base64}` } },
       ]
     : [
-        { type: "text", text: "Analyze this prescription PDF and return the JSON described in the system message." },
-        { type: "file", file: { filename: fileName || "prescription.pdf", file_data: `data:${mime};base64,${base64}` } },
+        {
+          type: "text",
+          text: `${SYSTEM_PROMPT}\n\nAnalyze this prescription PDF and return ONLY the JSON object.`,
+        },
+        {
+          type: "file",
+          file: {
+            filename: fileName || "prescription.pdf",
+            file_data: `data:${mime};base64,${base64}`,
+          },
+        },
       ];
 
-  const res = await fetch("https://openrouter.ai/api/v1/chat/completions", {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      Authorization: `Bearer ${apiKey}`,
-      "HTTP-Referer": "https://smart-prescription-analyzer.vercel.app",
-      "X-Title": "Smart Prescription Analyzer",
-    },
-    body: JSON.stringify({
-      model: AI_MODEL,
-      messages: [
-        { role: "system", content: SYSTEM_PROMPT },
-        { role: "user", content: userContent },
-      ],
-      response_format: { type: "json_object" },
-    }),
-  });
+  const modelsToTry = process.env.OPENROUTER_MODEL
+    ? [process.env.OPENROUTER_MODEL, ...FREE_OPENROUTER_MODELS]
+    : FREE_OPENROUTER_MODELS;
 
-  if (!res.ok) {
-    const body = await res.text();
-    if (res.status === 429) throw new Error("AI service is busy — please try again in a moment.");
-    if (res.status === 401) throw new Error("Invalid OPENROUTER_API_KEY.");
-    if (res.status === 402) throw new Error("AI credits exhausted. Check your OpenRouter account.");
-    throw new Error(`AI request failed (${res.status}): ${body.slice(0, 300)}`);
+  let lastError = "AI service unavailable";
+
+  for (const model of modelsToTry) {
+    const res = await fetch("https://openrouter.ai/api/v1/chat/completions", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${apiKey}`,
+        "HTTP-Referer": "https://smart-prescription-analyzer.vercel.app",
+        "X-Title": "Smart Prescription Analyzer",
+      },
+      body: JSON.stringify({
+        model,
+        messages: [{ role: "user", content: userContent }],
+      }),
+    });
+
+    if (res.ok) {
+      const json = (await res.json()) as {
+        choices?: Array<{ message?: { content?: string } }>;
+        error?: { message?: string };
+      };
+      const raw = json.choices?.[0]?.message?.content;
+      if (raw) {
+        return parseAiJson(raw);
+      }
+    } else {
+      const body = await res.text();
+      if (res.status === 401) {
+        throw new Error("Invalid OPENROUTER_API_KEY.");
+      }
+      lastError = `(${res.status}) ${body.slice(0, 200)}`;
+      // If 402 (no credits), 429 (rate-limited), or 404/503 (model unavailable), automatically try the next free model!
+      continue;
+    }
   }
 
-  const json = (await res.json()) as { choices?: Array<{ message?: { content?: string } }> };
-  const raw = json.choices?.[0]?.message?.content ?? "{}";
-  const stripped = raw.trim().replace(/^```(?:json)?/i, "").replace(/```$/i, "").trim();
-  return AnalysisSchema.parse(JSON.parse(stripped));
+  throw new Error(`Free AI models busy. Please try again or add GEMINI_API_KEY in Vercel. Last error: ${lastError}`);
 }
 
 export const analyzePrescription = createServerFn({ method: "POST" })
