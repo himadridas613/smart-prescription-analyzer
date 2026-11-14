@@ -93,121 +93,46 @@ function parseAiJson(raw: string) {
   return AnalysisSchema.parse(JSON.parse(jsonString));
 }
 
-// Free OpenRouter vision models tried in order if no paid credits are available
-const FREE_OPENROUTER_MODELS = [
-  "google/gemma-3-27b-it:free",
-  "qwen/qwen2.5-vl-72b-instruct:free",
-  "qwen/qwen2.5-vl-32b-instruct:free",
-  "meta-llama/llama-3.2-11b-vision-instruct:free",
-  "mistralai/mistral-small-3.1-24b-instruct:free",
-];
+async function runAnalysis(mime: string, _fileName: string | undefined, base64: string) {
+  const geminiKey = process.env.GEMINI_API_KEY || process.env.VITE_GEMINI_API_KEY;
+  if (!geminiKey) {
+    throw new Error("GEMINI_API_KEY is not configured in Vercel environment variables.");
+  }
 
-async function runAnalysis(mime: string, fileName: string | undefined, base64: string) {
   const isImage = mime.startsWith("image/");
   const isPdf = mime === "application/pdf";
   if (!isImage && !isPdf) throw new Error("Unsupported file type");
 
-  // 1. Optional direct Google Gemini API support (100% free via Google AI Studio key)
-  const geminiKey = process.env.GEMINI_API_KEY || process.env.VITE_GEMINI_API_KEY;
-  if (geminiKey) {
-    const geminiRes = await fetch(
-      `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${geminiKey}`,
-      {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          systemInstruction: { parts: [{ text: SYSTEM_PROMPT }] },
-          contents: [
-            {
-              role: "user",
-              parts: [
-                { text: "Analyze this prescription and return ONLY the JSON object." },
-                { inlineData: { mimeType: mime, data: base64 } },
-              ],
-            },
-          ],
-          generationConfig: { responseMimeType: "application/json" },
-        }),
-      },
-    );
-
-    if (geminiRes.ok) {
-      const geminiJson = (await geminiRes.json()) as any;
-      const rawText = geminiJson.candidates?.[0]?.content?.parts?.[0]?.text ?? "{}";
-      return parseAiJson(rawText);
-    }
-  }
-
-  // 2. OpenRouter API with automatic fallback to :free vision models
-  const apiKey = process.env.OPENROUTER_API_KEY || process.env.VITE_OPENROUTER_API_KEY;
-  if (!apiKey) {
-    throw new Error("AI service not configured. Set OPENROUTER_API_KEY or GEMINI_API_KEY in Vercel.");
-  }
-
-  const userContent = isImage
-    ? [
-        {
-          type: "text",
-          text: `${SYSTEM_PROMPT}\n\nAnalyze this prescription image and return ONLY the JSON object.`,
-        },
-        { type: "image_url", image_url: { url: `data:${mime};base64,${base64}` } },
-      ]
-    : [
-        {
-          type: "text",
-          text: `${SYSTEM_PROMPT}\n\nAnalyze this prescription PDF and return ONLY the JSON object.`,
-        },
-        {
-          type: "file",
-          file: {
-            filename: fileName || "prescription.pdf",
-            file_data: `data:${mime};base64,${base64}`,
-          },
-        },
-      ];
-
-  const modelsToTry = process.env.OPENROUTER_MODEL
-    ? [process.env.OPENROUTER_MODEL, ...FREE_OPENROUTER_MODELS]
-    : FREE_OPENROUTER_MODELS;
-
-  let lastError = "AI service unavailable";
-
-  for (const model of modelsToTry) {
-    const res = await fetch("https://openrouter.ai/api/v1/chat/completions", {
+  // Use Gemini 3.8 Flash (Google AI Studio)
+  const geminiRes = await fetch(
+    `https://generativelanguage.googleapis.com/v1beta/models/gemini-3.8-flash:generateContent?key=${geminiKey}`,
+    {
       method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        Authorization: `Bearer ${apiKey}`,
-        "HTTP-Referer": "https://smart-prescription-analyzer.vercel.app",
-        "X-Title": "Smart Prescription Analyzer",
-      },
+      headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
-        model,
-        messages: [{ role: "user", content: userContent }],
+        systemInstruction: { parts: [{ text: SYSTEM_PROMPT }] },
+        contents: [
+          {
+            role: "user",
+            parts: [
+              { text: "Analyze this prescription and return ONLY the JSON object." },
+              { inlineData: { mimeType: mime, data: base64 } },
+            ],
+          },
+        ],
+        generationConfig: { responseMimeType: "application/json" },
       }),
-    });
+    },
+  );
 
-    if (res.ok) {
-      const json = (await res.json()) as {
-        choices?: Array<{ message?: { content?: string } }>;
-        error?: { message?: string };
-      };
-      const raw = json.choices?.[0]?.message?.content;
-      if (raw) {
-        return parseAiJson(raw);
-      }
-    } else {
-      const body = await res.text();
-      if (res.status === 401) {
-        throw new Error("Invalid OPENROUTER_API_KEY.");
-      }
-      lastError = `(${res.status}) ${body.slice(0, 200)}`;
-      // If 402 (no credits), 429 (rate-limited), or 404/503 (model unavailable), automatically try the next free model!
-      continue;
-    }
+  if (!geminiRes.ok) {
+    const errText = await geminiRes.text();
+    throw new Error(`Gemini API error (${geminiRes.status}): ${errText.slice(0, 300)}`);
   }
 
-  throw new Error(`Free AI models busy. Please try again or add GEMINI_API_KEY in Vercel. Last error: ${lastError}`);
+  const geminiJson = (await geminiRes.json()) as any;
+  const rawText = geminiJson.candidates?.[0]?.content?.parts?.[0]?.text ?? "{}";
+  return parseAiJson(rawText);
 }
 
 export const analyzePrescription = createServerFn({ method: "POST" })
