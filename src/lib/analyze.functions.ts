@@ -11,26 +11,27 @@ const InputSchema = z.object({
 });
 
 const AnalysisSchema = z.object({
-  patient_name: z.string().nullable().optional(),
-  doctor_name: z.string().nullable().optional(),
+  patient_name: z.string().nullable().optional().catch(null),
+  doctor_name: z.string().nullable().optional().catch(null),
   medicines: z
     .array(
       z.object({
-        name: z.string(),
-        dosage: z.string().nullable().optional(),
-        frequency: z.string().nullable().optional(),
-        duration: z.string().nullable().optional(),
-        instructions: z.string().nullable().optional(),
-        confidence: z.number().min(0).max(1).nullable().optional(),
+        name: z.string().catch("Unknown Medicine"),
+        dosage: z.string().nullable().optional().catch(null),
+        frequency: z.string().nullable().optional().catch(null),
+        duration: z.string().nullable().optional().catch(null),
+        instructions: z.string().nullable().optional().catch(null),
+        confidence: z.coerce.number().min(0).max(1).nullable().optional().catch(0.8),
       }),
     )
-    .default([]),
-  warnings: z.array(z.string()).default([]),
-  interactions: z.array(z.string()).default([]),
-  duplicates: z.array(z.string()).default([]),
-  summary: z.string().nullable().optional(),
-  risk_level: z.enum(["low", "medium", "high"]).default("low"),
-  confidence: z.number().min(0).max(1).default(0.8),
+    .default([])
+    .catch([]),
+  warnings: z.array(z.string()).default([]).catch([]),
+  interactions: z.array(z.string()).default([]).catch([]),
+  duplicates: z.array(z.string()).default([]).catch([]),
+  summary: z.string().nullable().optional().catch(null),
+  risk_level: z.enum(["low", "medium", "high"]).default("low").catch("low"),
+  confidence: z.coerce.number().min(0).max(1).default(0.8).catch(0.8),
 });
 
 const SYSTEM_PROMPT = `You are a clinical assistant that analyzes handwritten or printed prescriptions.
@@ -93,49 +94,105 @@ function parseAiJson(raw: string) {
   return AnalysisSchema.parse(JSON.parse(jsonString));
 }
 
+async function getAvailableGeminiModels(apiKey: string): Promise<string[]> {
+  const preferred = [
+    "gemini-2.5-flash",
+    "gemini-2.5-pro",
+    "gemini-2.0-flash",
+    "gemini-flash-latest",
+  ];
+  try {
+    const res = await fetch(
+      `https://generativelanguage.googleapis.com/v1beta/models?key=${apiKey}`,
+    );
+    if (!res.ok) return preferred;
+    const data = (await res.json()) as {
+      models?: Array<{ name: string; supportedGenerationMethods?: string[] }>;
+    };
+    const available = (data.models ?? [])
+      .filter((m) => m.supportedGenerationMethods?.includes("generateContent"))
+      .map((m) => m.name.replace(/^models\//, ""))
+      .filter((name) => name.includes("gemini") && !name.includes("embedding") && !name.includes("tts"));
+
+    if (available.length === 0) return preferred;
+
+    // Sort so preferred flash models are tried first, followed by any other available Gemini models
+    const sorted = [
+      ...preferred.filter((p) => available.includes(p)),
+      ...available.filter((a) => a.includes("flash") && !preferred.includes(a)),
+      ...available.filter((a) => !a.includes("flash") && !preferred.includes(a)),
+    ];
+    return sorted.length > 0 ? sorted : preferred;
+  } catch {
+    return preferred;
+  }
+}
+
 async function runAnalysis(mime: string, _fileName: string | undefined, base64: string) {
   const isImage = mime.startsWith("image/");
   const isPdf = mime === "application/pdf";
   if (!isImage && !isPdf) throw new Error("Unsupported file type");
 
-  // 1. Try Google Gemini API with robust model fallbacks
-  const geminiKey = process.env.GEMINI_API_KEY || process.env.VITE_GEMINI_API_KEY;
-  if (geminiKey) {
-    const models = ["gemini-2.0-flash", "gemini-1.5-flash", "gemini-flash"];
-    for (const model of models) {
-      try {
-        const res = await fetch(
-          `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${geminiKey}`,
-          {
-            method: "POST",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({
-              systemInstruction: { parts: [{ text: SYSTEM_PROMPT }] },
-              contents: [
-                {
-                  role: "user",
-                  parts: [
-                    { text: "Analyze this prescription and return ONLY the JSON object." },
-                    { inlineData: { mimeType: mime, data: base64 } },
-                  ],
-                },
-              ],
-              generationConfig: { responseMimeType: "application/json" },
-            }),
-          },
-        );
-        if (res.ok) {
-          const json = (await res.json()) as any;
-          const rawText = json.candidates?.[0]?.content?.parts?.[0]?.text ?? "{}";
+  const geminiKey = (
+    process.env.GEMINI_API_KEY ||
+    process.env.VITE_GEMINI_API_KEY ||
+    ""
+  ).trim();
+
+  if (!geminiKey) {
+    throw new Error(
+      "GEMINI_API_KEY is missing on the server. Add GEMINI_API_KEY in Vercel -> Settings -> Environment Variables and Redeploy.",
+    );
+  }
+
+  const models = await getAvailableGeminiModels(geminiKey);
+  let lastError = "";
+
+  for (const model of models) {
+    try {
+      const res = await fetch(
+        `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${geminiKey}`,
+        {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            systemInstruction: { parts: [{ text: SYSTEM_PROMPT }] },
+            contents: [
+              {
+                role: "user",
+                parts: [
+                  { text: "Analyze this prescription and return ONLY the JSON object." },
+                  { inlineData: { mimeType: mime, data: base64 } },
+                ],
+              },
+            ],
+            generationConfig: { responseMimeType: "application/json" },
+          }),
+        },
+      );
+
+      if (res.ok) {
+        const json = (await res.json()) as any;
+        const rawText = json.candidates?.[0]?.content?.parts?.[0]?.text;
+        if (rawText) {
           return parseAiJson(rawText);
         }
-      } catch {
-        continue;
+        lastError = `Model ${model} returned an empty response.`;
+      } else {
+        const errBody = await res.text();
+        lastError = `(${model} -> HTTP ${res.status}): ${errBody.slice(0, 200)}`;
+        // If the API key itself is invalid (400 API_KEY_INVALID or 403), stop immediately
+        if (res.status === 400 && errBody.includes("API_KEY_INVALID")) {
+          throw new Error("Your GEMINI_API_KEY is invalid. Please copy a fresh key from Google AI Studio.");
+        }
       }
+    } catch (err: any) {
+      if (err?.message?.includes("GEMINI_API_KEY is invalid")) throw err;
+      lastError = err?.message || String(err);
     }
   }
 
-  throw new Error("AI analysis failed. Please verify your GEMINI_API_KEY in Vercel environment variables.");
+  throw new Error(`Gemini API failed across models. Last error: ${lastError}`);
 }
 
 export const analyzePrescription = createServerFn({ method: "POST" })
