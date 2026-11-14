@@ -1,5 +1,6 @@
 import { createServerFn } from "@tanstack/react-start";
-import { requireSupabaseAuth } from "@/integrations/supabase/auth-middleware";
+import * as authMiddlewareModule from "@/integrations/supabase/auth-middleware";
+import * as supabaseServerModule from "@/integrations/supabase/client.server";
 import { z } from "zod";
 
 const InputSchema = z.object({
@@ -13,14 +14,18 @@ const InputSchema = z.object({
 const AnalysisSchema = z.object({
   patient_name: z.string().nullable().optional(),
   doctor_name: z.string().nullable().optional(),
-  medicines: z.array(z.object({
-    name: z.string(),
-    dosage: z.string().nullable().optional(),
-    frequency: z.string().nullable().optional(),
-    duration: z.string().nullable().optional(),
-    instructions: z.string().nullable().optional(),
-    confidence: z.number().min(0).max(1).nullable().optional(),
-  })).default([]),
+  medicines: z
+    .array(
+      z.object({
+        name: z.string(),
+        dosage: z.string().nullable().optional(),
+        frequency: z.string().nullable().optional(),
+        duration: z.string().nullable().optional(),
+        instructions: z.string().nullable().optional(),
+        confidence: z.number().min(0).max(1).nullable().optional(),
+      }),
+    )
+    .default([]),
   warnings: z.array(z.string()).default([]),
   interactions: z.array(z.string()).default([]),
   duplicates: z.array(z.string()).default([]),
@@ -66,6 +71,45 @@ Rules:
   fill a gap — omit it and add a warning that part of the prescription was illegible.
 - Output ONLY the JSON object.`;
 
+async function getAuthContext(): Promise<{ supabase: any; userId: string }> {
+  const mw = (authMiddlewareModule as any).requireSupabaseAuth;
+
+  // If requireSupabaseAuth is a valid TanStack middleware with a server function, invoke it safely
+  if (mw?.options?.server) {
+    let capturedContext: any;
+    await mw.options.server({
+      next: async (opts?: { context?: any }) => {
+        capturedContext = opts?.context;
+        return opts;
+      },
+      context: {},
+    });
+    if (capturedContext?.supabase && capturedContext?.userId) {
+      return capturedContext;
+    }
+  }
+
+  // Fallback: resolve directly from client.server.ts exports
+  const srv = supabaseServerModule as any;
+  const getClient =
+    srv.getSupabaseServerClient ||
+    srv.createSupabaseServerClient ||
+    srv.createServerSupabaseClient ||
+    srv.getServerSupabase ||
+    srv.default;
+
+  if (typeof getClient === "function") {
+    const supabase = await getClient();
+    const { data, error } = await supabase.auth.getUser();
+    if (error || !data?.user) {
+      throw new Error("Unauthorized: Please sign in again.");
+    }
+    return { supabase, userId: data.user.id };
+  }
+
+  throw new Error("Unable to initialize Supabase server client.");
+}
+
 async function setStage(
   supabase: { from: (t: string) => any },
   id: string,
@@ -74,8 +118,6 @@ async function setStage(
   await supabase.from("prescriptions").update({ stage }).eq("id", id);
 }
 
-// Vision model used for OCR/analysis. Defaults to a free-tier OpenRouter model;
-// override with the OPENROUTER_MODEL environment variable.
 const AI_MODEL = process.env.OPENROUTER_MODEL || "google/gemini-2.5-flash";
 
 async function runAnalysis(mime: string, fileName: string | undefined, base64: string) {
@@ -101,7 +143,7 @@ async function runAnalysis(mime: string, fileName: string | undefined, base64: s
     headers: {
       "Content-Type": "application/json",
       Authorization: `Bearer ${apiKey}`,
-      "HTTP-Referer": "https://github.com/your-username/smart-prescription-analyzer",
+      "HTTP-Referer": "https://smart-prescription-analyzer.vercel.app",
       "X-Title": "Smart Prescription Analyzer",
     },
     body: JSON.stringify({
@@ -122,16 +164,16 @@ async function runAnalysis(mime: string, fileName: string | undefined, base64: s
     throw new Error(`AI request failed (${res.status}): ${body.slice(0, 300)}`);
   }
 
-  const json = await res.json() as { choices?: Array<{ message?: { content?: string } }> };
+  const json = (await res.json()) as { choices?: Array<{ message?: { content?: string } }> };
   const raw = json.choices?.[0]?.message?.content ?? "{}";
   const stripped = raw.trim().replace(/^```(?:json)?/i, "").replace(/```$/i, "").trim();
   return AnalysisSchema.parse(JSON.parse(stripped));
 }
 
 export const analyzePrescription = createServerFn({ method: "POST" })
-  .middleware([requireSupabaseAuth])
   .inputValidator((d: unknown) => InputSchema.parse(d))
-  .handler(async ({ data, context }) => {
+  .handler(async ({ data }) => {
+    const context = await getAuthContext();
     const { data: presc, error: pErr } = await context.supabase
       .from("prescriptions")
       .insert({
@@ -143,7 +185,8 @@ export const analyzePrescription = createServerFn({ method: "POST" })
         status: "processing",
         stage: "uploading",
       })
-      .select("id").single();
+      .select("id")
+      .single();
     if (pErr || !presc) throw new Error(pErr?.message || "Failed to record upload");
 
     await context.supabase.from("notifications").insert({
@@ -174,10 +217,14 @@ export const analyzePrescription = createServerFn({ method: "POST" })
           risk_level: parsed.risk_level,
           confidence: parsed.confidence,
         })
-        .select("id").single();
+        .select("id")
+        .single();
       if (rErr || !report) throw new Error(rErr?.message || "Failed to save report");
 
-      await context.supabase.from("prescriptions").update({ status: "completed", stage: "completed", error: null }).eq("id", presc.id);
+      await context.supabase
+        .from("prescriptions")
+        .update({ status: "completed", stage: "completed", error: null })
+        .eq("id", presc.id);
       await context.supabase.from("notifications").insert({
         user_id: context.userId,
         title: "Analysis complete",
@@ -188,8 +235,10 @@ export const analyzePrescription = createServerFn({ method: "POST" })
       return { reportId: report.id };
     } catch (e: unknown) {
       const message = e instanceof Error ? e.message : "Analysis failed";
-      await context.supabase.from("prescriptions")
-        .update({ status: "failed", stage: "failed", error: message }).eq("id", presc.id);
+      await context.supabase
+        .from("prescriptions")
+        .update({ status: "failed", stage: "failed", error: message })
+        .eq("id", presc.id);
       await context.supabase.from("notifications").insert({
         user_id: context.userId,
         title: "Analysis failed",
@@ -201,9 +250,9 @@ export const analyzePrescription = createServerFn({ method: "POST" })
   });
 
 export const retryAnalysis = createServerFn({ method: "POST" })
-  .middleware([requireSupabaseAuth])
   .inputValidator((d: unknown) => z.object({ prescriptionId: z.string().uuid() }).parse(d))
-  .handler(async ({ data, context }) => {
+  .handler(async ({ data }) => {
+    const context = await getAuthContext();
     const { data: presc, error: pErr } = await context.supabase
       .from("prescriptions")
       .select("id, user_id, storage_path, file_name, file_type")
@@ -212,8 +261,10 @@ export const retryAnalysis = createServerFn({ method: "POST" })
     if (pErr || !presc) throw new Error(pErr?.message || "Prescription not found");
     if (presc.user_id !== context.userId) throw new Error("Not allowed");
 
-    await context.supabase.from("prescriptions")
-      .update({ status: "processing", stage: "uploading", error: null }).eq("id", presc.id);
+    await context.supabase
+      .from("prescriptions")
+      .update({ status: "processing", stage: "uploading", error: null })
+      .eq("id", presc.id);
 
     await setStage(context.supabase, presc.id, "preprocessing");
     try {
@@ -227,7 +278,6 @@ export const retryAnalysis = createServerFn({ method: "POST" })
       const parsed = await runAnalysis(mime, presc.file_name ?? undefined, base64);
       await setStage(context.supabase, presc.id, "generating_report");
 
-      // Remove existing report(s) for this prescription
       await context.supabase.from("reports").delete().eq("prescription_id", presc.id);
 
       const { data: report, error: rErr } = await context.supabase
@@ -245,10 +295,14 @@ export const retryAnalysis = createServerFn({ method: "POST" })
           risk_level: parsed.risk_level,
           confidence: parsed.confidence,
         })
-        .select("id").single();
+        .select("id")
+        .single();
       if (rErr || !report) throw new Error(rErr?.message || "Failed to save report");
 
-      await context.supabase.from("prescriptions").update({ status: "completed", stage: "completed", error: null }).eq("id", presc.id);
+      await context.supabase
+        .from("prescriptions")
+        .update({ status: "completed", stage: "completed", error: null })
+        .eq("id", presc.id);
       await context.supabase.from("notifications").insert({
         user_id: context.userId,
         title: "Re-analysis complete",
@@ -259,8 +313,10 @@ export const retryAnalysis = createServerFn({ method: "POST" })
       return { reportId: report.id };
     } catch (e: unknown) {
       const message = e instanceof Error ? e.message : "Analysis failed";
-      await context.supabase.from("prescriptions")
-        .update({ status: "failed", stage: "failed", error: message }).eq("id", presc.id);
+      await context.supabase
+        .from("prescriptions")
+        .update({ status: "failed", stage: "failed", error: message })
+        .eq("id", presc.id);
       await context.supabase.from("notifications").insert({
         user_id: context.userId,
         title: "Analysis failed",
@@ -271,41 +327,49 @@ export const retryAnalysis = createServerFn({ method: "POST" })
     }
   });
 
-export const listUploads = createServerFn({ method: "GET" })
-  .middleware([requireSupabaseAuth])
-  .handler(async ({ context }) => {
-    const { data, error } = await context.supabase
-      .from("prescriptions")
-      .select("id, file_name, file_type, file_size, status, stage, error, storage_path, created_at, updated_at, reports(id, medicines, patient_name)")
-      .order("created_at", { ascending: false })
-      .limit(500);
-    if (error) throw new Error(error.message);
-    return (data ?? []).map((row) => {
-      const reports = (row.reports ?? []) as Array<{ id: string; medicines: unknown; patient_name: string | null }>;
-      const report = reports[0];
-      const medicines = Array.isArray(report?.medicines)
-        ? (report!.medicines as Array<{ name?: string }>).map(m => m?.name).filter(Boolean).join(", ")
-        : "";
-      return {
-        id: row.id,
-        file_name: row.file_name,
-        file_type: row.file_type,
-        file_size: row.file_size,
-        status: row.status,
-        stage: row.stage,
-        error: row.error,
-        created_at: row.created_at,
-        report_id: report?.id ?? null,
-        patient_name: report?.patient_name ?? null,
-        medicines,
-      };
-    });
+export const listUploads = createServerFn({ method: "GET" }).handler(async () => {
+  const context = await getAuthContext();
+  const { data, error } = await context.supabase
+    .from("prescriptions")
+    .select(
+      "id, file_name, file_type, file_size, status, stage, error, storage_path, created_at, updated_at, reports(id, medicines, patient_name)",
+    )
+    .order("created_at", { ascending: false })
+    .limit(500);
+  if (error) throw new Error(error.message);
+  return (data ?? []).map((row: any) => {
+    const reports = (row.reports ?? []) as Array<{
+      id: string;
+      medicines: unknown;
+      patient_name: string | null;
+    }>;
+    const report = reports[0];
+    const medicines = Array.isArray(report?.medicines)
+      ? (report!.medicines as Array<{ name?: string }>)
+          .map((m) => m?.name)
+          .filter(Boolean)
+          .join(", ")
+      : "";
+    return {
+      id: row.id,
+      file_name: row.file_name,
+      file_type: row.file_type,
+      file_size: row.file_size,
+      status: row.status,
+      stage: row.stage,
+      error: row.error,
+      created_at: row.created_at,
+      report_id: report?.id ?? null,
+      patient_name: report?.patient_name ?? null,
+      medicines,
+    };
   });
+});
 
 export const deleteUpload = createServerFn({ method: "POST" })
-  .middleware([requireSupabaseAuth])
   .inputValidator((d: unknown) => z.object({ prescriptionId: z.string().uuid() }).parse(d))
-  .handler(async ({ data, context }) => {
+  .handler(async ({ data }) => {
+    const context = await getAuthContext();
     const { data: presc, error: pErr } = await context.supabase
       .from("prescriptions")
       .select("id, user_id, storage_path")
@@ -314,7 +378,6 @@ export const deleteUpload = createServerFn({ method: "POST" })
     if (pErr || !presc) throw new Error(pErr?.message || "Prescription not found");
     if (presc.user_id !== context.userId) throw new Error("Not allowed");
 
-    // Best-effort storage cleanup; ignore errors so DB delete still proceeds
     await context.supabase.storage.from("prescriptions").remove([presc.storage_path]);
     await context.supabase.from("reports").delete().eq("prescription_id", presc.id);
     const { error } = await context.supabase.from("prescriptions").delete().eq("id", presc.id);
@@ -323,9 +386,9 @@ export const deleteUpload = createServerFn({ method: "POST" })
   });
 
 export const getUploadStatus = createServerFn({ method: "GET" })
-  .middleware([requireSupabaseAuth])
   .inputValidator((d: unknown) => z.object({ prescriptionId: z.string().uuid() }).parse(d))
-  .handler(async ({ data, context }) => {
+  .handler(async ({ data }) => {
+    const context = await getAuthContext();
     const { data: row, error } = await context.supabase
       .from("prescriptions")
       .select("id, status, stage, error, reports(id)")
@@ -334,5 +397,10 @@ export const getUploadStatus = createServerFn({ method: "GET" })
     if (error) throw new Error(error.message);
     if (!row) throw new Error("Upload not found");
     const reports = (row.reports ?? []) as Array<{ id: string }>;
-    return { status: row.status, stage: row.stage, error: row.error, reportId: reports[0]?.id ?? null };
+    return {
+      status: row.status,
+      stage: row.stage,
+      error: row.error,
+      reportId: reports[0]?.id ?? null,
+    };
   });
