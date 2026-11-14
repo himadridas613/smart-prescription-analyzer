@@ -12,10 +12,9 @@ export default defineConfig({
     tailwindcss(),
     tanstackStart({
       server: { entry: "server" },
-      target: "cloudflare",
       router: {
         routesDirectory: "./router",
-      }
+      },
     }),
     viteReact(),
     nitro(),

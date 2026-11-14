@@ -1,6 +1,5 @@
 import { createFileRoute, useNavigate } from "@tanstack/react-router";
 import { useCallback, useState } from "react";
-import { useServerFn } from "@tanstack/react-start";
 import { supabase } from "@/integrations/supabase/client";
 import { analyzePrescription } from "@/lib/analyze.functions";
 import { Button } from "@/components/ui/button";
@@ -28,7 +27,6 @@ const ACCEPT = ["image/jpeg", "image/png", "image/webp", "image/heic", "applicat
 function UploadPage() {
   const { user } = Route.useRouteContext();
   const navigate = useNavigate();
-  const analyze = useServerFn(analyzePrescription);
 
   const [file, setFile] = useState<File | null>(null);
   const [preview, setPreview] = useState<string | null>(null);
@@ -37,8 +35,14 @@ function UploadPage() {
   const [dragging, setDragging] = useState(false);
 
   const onFile = useCallback((f: File) => {
-    if (!ACCEPT.includes(f.type)) { toast.error("Unsupported file type."); return; }
-    if (f.size > MAX_MB * 1024 * 1024) { toast.error(`File must be under ${MAX_MB}MB.`); return; }
+    if (!ACCEPT.includes(f.type)) {
+      toast.error("Unsupported file type.");
+      return;
+    }
+    if (f.size > MAX_MB * 1024 * 1024) {
+      toast.error(`File must be under ${MAX_MB}MB.`);
+      return;
+    }
     setFile(f);
     if (f.type.startsWith("image/")) {
       const url = URL.createObjectURL(f);
@@ -54,7 +58,9 @@ function UploadPage() {
       const ext = file.name.split(".").pop() || "bin";
       const path = `${user.id}/${Date.now()}.${ext}`;
       const up = await supabase.storage.from("prescriptions").upload(path, file, {
-        cacheControl: "3600", upsert: false, contentType: file.type,
+        cacheControl: "3600",
+        upsert: false,
+        contentType: file.type,
       });
       if (up.error) throw up.error;
       setProgress(45);
@@ -69,7 +75,7 @@ function UploadPage() {
       setProgress(65);
       setPhase("analyzing");
 
-      const result = await analyze({
+      const result = await analyzePrescription({
         data: {
           storagePath: path,
           fileName: file.name,
@@ -94,42 +100,75 @@ function UploadPage() {
   return (
     <div className="mx-auto max-w-3xl space-y-6">
       <div>
-        <h1 className="text-3xl font-bold" style={{ fontFamily: "Space Grotesk, sans-serif" }}>Upload prescription</h1>
+        <h1 className="text-3xl font-bold" style={{ fontFamily: "Space Grotesk, sans-serif" }}>
+          Upload prescription
+        </h1>
         <p className="mt-1 text-muted-foreground">Photos, PDFs, or camera. Max {MAX_MB}MB.</p>
       </div>
 
       {!file && (
         <label
-          onDragOver={e => { e.preventDefault(); setDragging(true); }}
-          onDragLeave={() => setDragging(false)}
-          onDrop={e => {
-            e.preventDefault(); setDragging(false);
-            const f = e.dataTransfer.files?.[0]; if (f) onFile(f);
+          onDragOver={(e) => {
+            e.preventDefault();
+            setDragging(true);
           }}
-          className={`glass block cursor-pointer rounded-3xl border-2 border-dashed p-14 text-center transition ${dragging ? "border-primary bg-primary/5" : "border-border hover:border-primary/50"}`}
+          onDragLeave={() => setDragging(false)}
+          onDrop={(e) => {
+            e.preventDefault();
+            setDragging(false);
+            const f = e.dataTransfer.files?.[0];
+            if (f) onFile(f);
+          }}
+          className={`glass block cursor-pointer rounded-3xl border-2 border-dashed p-14 text-center transition ${
+            dragging ? "border-primary bg-primary/5" : "border-border hover:border-primary/50"
+          }`}
         >
           <div className="mx-auto mb-4 grid h-16 w-16 place-items-center rounded-2xl gradient-hero shadow-glow">
             <UploadCloud className="h-8 w-8 text-primary-foreground" />
           </div>
           <p className="text-lg font-semibold">Drop your prescription here</p>
           <p className="mt-1 text-sm text-muted-foreground">or click to browse — JPG, PNG, HEIC or PDF</p>
-          <input type="file" className="hidden" accept={ACCEPT.join(",")} onChange={e => { const f = e.target.files?.[0]; if (f) onFile(f); }} />
+          <input
+            type="file"
+            className="hidden"
+            accept={ACCEPT.join(",")}
+            onChange={(e) => {
+              const f = e.target.files?.[0];
+              if (f) onFile(f);
+            }}
+          />
         </label>
       )}
 
       {file && (
-        <motion.div initial={{ opacity: 0, y: 10 }} animate={{ opacity: 1, y: 0 }}
-          className="rounded-3xl border border-border bg-card p-5 shadow-soft">
+        <motion.div
+          initial={{ opacity: 0, y: 10 }}
+          animate={{ opacity: 1, y: 0 }}
+          className="rounded-3xl border border-border bg-card p-5 shadow-soft"
+        >
           <div className="flex items-start gap-4">
             <div className="grid h-14 w-14 shrink-0 place-items-center overflow-hidden rounded-xl bg-secondary">
-              {preview ? <img src={preview} alt="preview" className="h-full w-full object-cover" /> : <FileText className="h-6 w-6 text-muted-foreground" />}
+              {preview ? (
+                <img src={preview} alt="preview" className="h-full w-full object-cover" />
+              ) : (
+                <FileText className="h-6 w-6 text-muted-foreground" />
+              )}
             </div>
             <div className="min-w-0 flex-1">
               <p className="truncate font-medium">{file.name}</p>
-              <p className="text-xs text-muted-foreground">{(file.size / 1024 / 1024).toFixed(2)} MB · {file.type}</p>
+              <p className="text-xs text-muted-foreground">
+                {(file.size / 1024 / 1024).toFixed(2)} MB · {file.type}
+              </p>
             </div>
             {!busy && (
-              <Button variant="ghost" size="icon" onClick={() => { setFile(null); setPreview(null); }}>
+              <Button
+                variant="ghost"
+                size="icon"
+                onClick={() => {
+                  setFile(null);
+                  setPreview(null);
+                }}
+              >
                 <X className="h-4 w-4" />
               </Button>
             )}
@@ -149,7 +188,11 @@ function UploadPage() {
             </div>
           )}
           <div className="mt-5 flex justify-end gap-2">
-            <Button onClick={run} disabled={busy} className="rounded-full gradient-hero text-primary-foreground border-0 shadow-glow">
+            <Button
+              onClick={run}
+              disabled={busy}
+              className="rounded-full gradient-hero text-primary-foreground border-0 shadow-glow"
+            >
               {busy ? <Loader2 className="mr-2 h-4 w-4 animate-spin" /> : <Sparkles className="mr-2 h-4 w-4" />}
               {busy ? "Analyzing…" : "Analyze with AI"}
             </Button>

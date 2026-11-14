@@ -1,6 +1,5 @@
 import { createServerFn } from "@tanstack/react-start";
-import * as authMiddlewareModule from "@/integrations/supabase/auth-middleware";
-import * as supabaseServerModule from "@/integrations/supabase/client.server";
+import { requireSupabaseAuth } from "@/integrations/supabase/auth-middleware";
 import { z } from "zod";
 
 const InputSchema = z.object({
@@ -71,45 +70,6 @@ Rules:
   fill a gap — omit it and add a warning that part of the prescription was illegible.
 - Output ONLY the JSON object.`;
 
-async function getAuthContext(): Promise<{ supabase: any; userId: string }> {
-  const mw = (authMiddlewareModule as any).requireSupabaseAuth;
-
-  // If requireSupabaseAuth is a valid TanStack middleware with a server function, invoke it safely
-  if (mw?.options?.server) {
-    let capturedContext: any;
-    await mw.options.server({
-      next: async (opts?: { context?: any }) => {
-        capturedContext = opts?.context;
-        return opts;
-      },
-      context: {},
-    });
-    if (capturedContext?.supabase && capturedContext?.userId) {
-      return capturedContext;
-    }
-  }
-
-  // Fallback: resolve directly from client.server.ts exports
-  const srv = supabaseServerModule as any;
-  const getClient =
-    srv.getSupabaseServerClient ||
-    srv.createSupabaseServerClient ||
-    srv.createServerSupabaseClient ||
-    srv.getServerSupabase ||
-    srv.default;
-
-  if (typeof getClient === "function") {
-    const supabase = await getClient();
-    const { data, error } = await supabase.auth.getUser();
-    if (error || !data?.user) {
-      throw new Error("Unauthorized: Please sign in again.");
-    }
-    return { supabase, userId: data.user.id };
-  }
-
-  throw new Error("Unable to initialize Supabase server client.");
-}
-
 async function setStage(
   supabase: { from: (t: string) => any },
   id: string,
@@ -121,8 +81,8 @@ async function setStage(
 const AI_MODEL = process.env.OPENROUTER_MODEL || "google/gemini-2.5-flash";
 
 async function runAnalysis(mime: string, fileName: string | undefined, base64: string) {
-  const apiKey = process.env.OPENROUTER_API_KEY;
-  if (!apiKey) throw new Error("AI service not configured. Set OPENROUTER_API_KEY.");
+  const apiKey = process.env.OPENROUTER_API_KEY || process.env.VITE_OPENROUTER_API_KEY;
+  if (!apiKey) throw new Error("AI service not configured. Set OPENROUTER_API_KEY in Vercel.");
 
   const isImage = mime.startsWith("image/");
   const isPdf = mime === "application/pdf";
@@ -171,9 +131,9 @@ async function runAnalysis(mime: string, fileName: string | undefined, base64: s
 }
 
 export const analyzePrescription = createServerFn({ method: "POST" })
+  .middleware([requireSupabaseAuth])
   .inputValidator((d: unknown) => InputSchema.parse(d))
-  .handler(async ({ data }) => {
-    const context = await getAuthContext();
+  .handler(async ({ data, context }) => {
     const { data: presc, error: pErr } = await context.supabase
       .from("prescriptions")
       .insert({
@@ -250,9 +210,9 @@ export const analyzePrescription = createServerFn({ method: "POST" })
   });
 
 export const retryAnalysis = createServerFn({ method: "POST" })
+  .middleware([requireSupabaseAuth])
   .inputValidator((d: unknown) => z.object({ prescriptionId: z.string().uuid() }).parse(d))
-  .handler(async ({ data }) => {
-    const context = await getAuthContext();
+  .handler(async ({ data, context }) => {
     const { data: presc, error: pErr } = await context.supabase
       .from("prescriptions")
       .select("id, user_id, storage_path, file_name, file_type")
@@ -327,49 +287,50 @@ export const retryAnalysis = createServerFn({ method: "POST" })
     }
   });
 
-export const listUploads = createServerFn({ method: "GET" }).handler(async () => {
-  const context = await getAuthContext();
-  const { data, error } = await context.supabase
-    .from("prescriptions")
-    .select(
-      "id, file_name, file_type, file_size, status, stage, error, storage_path, created_at, updated_at, reports(id, medicines, patient_name)",
-    )
-    .order("created_at", { ascending: false })
-    .limit(500);
-  if (error) throw new Error(error.message);
-  return (data ?? []).map((row: any) => {
-    const reports = (row.reports ?? []) as Array<{
-      id: string;
-      medicines: unknown;
-      patient_name: string | null;
-    }>;
-    const report = reports[0];
-    const medicines = Array.isArray(report?.medicines)
-      ? (report!.medicines as Array<{ name?: string }>)
-          .map((m) => m?.name)
-          .filter(Boolean)
-          .join(", ")
-      : "";
-    return {
-      id: row.id,
-      file_name: row.file_name,
-      file_type: row.file_type,
-      file_size: row.file_size,
-      status: row.status,
-      stage: row.stage,
-      error: row.error,
-      created_at: row.created_at,
-      report_id: report?.id ?? null,
-      patient_name: report?.patient_name ?? null,
-      medicines,
-    };
+export const listUploads = createServerFn({ method: "GET" })
+  .middleware([requireSupabaseAuth])
+  .handler(async ({ context }) => {
+    const { data, error } = await context.supabase
+      .from("prescriptions")
+      .select(
+        "id, file_name, file_type, file_size, status, stage, error, storage_path, created_at, updated_at, reports(id, medicines, patient_name)",
+      )
+      .order("created_at", { ascending: false })
+      .limit(500);
+    if (error) throw new Error(error.message);
+    return (data ?? []).map((row) => {
+      const reports = (row.reports ?? []) as Array<{
+        id: string;
+        medicines: unknown;
+        patient_name: string | null;
+      }>;
+      const report = reports[0];
+      const medicines = Array.isArray(report?.medicines)
+        ? (report!.medicines as Array<{ name?: string }>)
+            .map((m) => m?.name)
+            .filter(Boolean)
+            .join(", ")
+        : "";
+      return {
+        id: row.id,
+        file_name: row.file_name,
+        file_type: row.file_type,
+        file_size: row.file_size,
+        status: row.status,
+        stage: row.stage,
+        error: row.error,
+        created_at: row.created_at,
+        report_id: report?.id ?? null,
+        patient_name: report?.patient_name ?? null,
+        medicines,
+      };
+    });
   });
-});
 
 export const deleteUpload = createServerFn({ method: "POST" })
+  .middleware([requireSupabaseAuth])
   .inputValidator((d: unknown) => z.object({ prescriptionId: z.string().uuid() }).parse(d))
-  .handler(async ({ data }) => {
-    const context = await getAuthContext();
+  .handler(async ({ data, context }) => {
     const { data: presc, error: pErr } = await context.supabase
       .from("prescriptions")
       .select("id, user_id, storage_path")
@@ -386,9 +347,9 @@ export const deleteUpload = createServerFn({ method: "POST" })
   });
 
 export const getUploadStatus = createServerFn({ method: "GET" })
+  .middleware([requireSupabaseAuth])
   .inputValidator((d: unknown) => z.object({ prescriptionId: z.string().uuid() }).parse(d))
-  .handler(async ({ data }) => {
-    const context = await getAuthContext();
+  .handler(async ({ data, context }) => {
     const { data: row, error } = await context.supabase
       .from("prescriptions")
       .select("id, status, stage, error, reports(id)")
