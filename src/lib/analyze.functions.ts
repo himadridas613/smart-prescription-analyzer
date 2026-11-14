@@ -94,58 +94,48 @@ function parseAiJson(raw: string) {
 }
 
 async function runAnalysis(mime: string, _fileName: string | undefined, base64: string) {
-  const geminiKey = process.env.GEMINI_API_KEY || process.env.VITE_GEMINI_API_KEY;
-  if (!geminiKey) {
-    throw new Error("GEMINI_API_KEY is not configured in Vercel environment variables.");
-  }
-
   const isImage = mime.startsWith("image/");
   const isPdf = mime === "application/pdf";
   if (!isImage && !isPdf) throw new Error("Unsupported file type");
 
-  // Use gemini-1.5-flash for fast, highly reliable OCR and analysis
-  const controller = new AbortController();
-  const timeoutId = setTimeout(() => controller.abort(), 25000);
-
-  try {
-    const geminiRes = await fetch(
-      `https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key=${geminiKey}`,
-      {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          systemInstruction: { parts: [{ text: SYSTEM_PROMPT }] },
-          contents: [
-            {
-              role: "user",
-              parts: [
-                { text: "Analyze this prescription and return ONLY the JSON object." },
-                { inlineData: { mimeType: mime, data: base64 } },
+  // 1. Try Google Gemini API with robust model fallbacks
+  const geminiKey = process.env.GEMINI_API_KEY || process.env.VITE_GEMINI_API_KEY;
+  if (geminiKey) {
+    const models = ["gemini-2.0-flash", "gemini-1.5-flash", "gemini-flash"];
+    for (const model of models) {
+      try {
+        const res = await fetch(
+          `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${geminiKey}`,
+          {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+              systemInstruction: { parts: [{ text: SYSTEM_PROMPT }] },
+              contents: [
+                {
+                  role: "user",
+                  parts: [
+                    { text: "Analyze this prescription and return ONLY the JSON object." },
+                    { inlineData: { mimeType: mime, data: base64 } },
+                  ],
+                },
               ],
-            },
-          ],
-          generationConfig: { responseMimeType: "application/json" },
-        }),
-        signal: controller.signal,
-      },
-    );
-    clearTimeout(timeoutId);
-
-    if (!geminiRes.ok) {
-      const errText = await geminiRes.text();
-      throw new Error(`Gemini API error (${geminiRes.status}): ${errText.slice(0, 300)}`);
+              generationConfig: { responseMimeType: "application/json" },
+            }),
+          },
+        );
+        if (res.ok) {
+          const json = (await res.json()) as any;
+          const rawText = json.candidates?.[0]?.content?.parts?.[0]?.text ?? "{}";
+          return parseAiJson(rawText);
+        }
+      } catch {
+        continue;
+      }
     }
-
-    const geminiJson = (await geminiRes.json()) as any;
-    const rawText = geminiJson.candidates?.[0]?.content?.parts?.[0]?.text ?? "{}";
-    return parseAiJson(rawText);
-  } catch (err: any) {
-    clearTimeout(timeoutId);
-    if (err.name === "AbortError") {
-      throw new Error("AI analysis timed out. Please try again.");
-    }
-    throw err;
   }
+
+  throw new Error("AI analysis failed. Please verify your GEMINI_API_KEY in Vercel environment variables.");
 }
 
 export const analyzePrescription = createServerFn({ method: "POST" })
