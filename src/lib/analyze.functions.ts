@@ -103,36 +103,49 @@ async function runAnalysis(mime: string, _fileName: string | undefined, base64: 
   const isPdf = mime === "application/pdf";
   if (!isImage && !isPdf) throw new Error("Unsupported file type");
 
-  // Use Gemini 3.8 Flash (Google AI Studio)
-  const geminiRes = await fetch(
-    `https://generativelanguage.googleapis.com/v1beta/models/gemini-3.8-flash:generateContent?key=${geminiKey}`,
-    {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        systemInstruction: { parts: [{ text: SYSTEM_PROMPT }] },
-        contents: [
-          {
-            role: "user",
-            parts: [
-              { text: "Analyze this prescription and return ONLY the JSON object." },
-              { inlineData: { mimeType: mime, data: base64 } },
-            ],
-          },
-        ],
-        generationConfig: { responseMimeType: "application/json" },
-      }),
-    },
-  );
+  // Use gemini-1.5-flash for fast, highly reliable OCR and analysis
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => controller.abort(), 25000);
 
-  if (!geminiRes.ok) {
-    const errText = await geminiRes.text();
-    throw new Error(`Gemini API error (${geminiRes.status}): ${errText.slice(0, 300)}`);
+  try {
+    const geminiRes = await fetch(
+      `https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key=${geminiKey}`,
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          systemInstruction: { parts: [{ text: SYSTEM_PROMPT }] },
+          contents: [
+            {
+              role: "user",
+              parts: [
+                { text: "Analyze this prescription and return ONLY the JSON object." },
+                { inlineData: { mimeType: mime, data: base64 } },
+              ],
+            },
+          ],
+          generationConfig: { responseMimeType: "application/json" },
+        }),
+        signal: controller.signal,
+      },
+    );
+    clearTimeout(timeoutId);
+
+    if (!geminiRes.ok) {
+      const errText = await geminiRes.text();
+      throw new Error(`Gemini API error (${geminiRes.status}): ${errText.slice(0, 300)}`);
+    }
+
+    const geminiJson = (await geminiRes.json()) as any;
+    const rawText = geminiJson.candidates?.[0]?.content?.parts?.[0]?.text ?? "{}";
+    return parseAiJson(rawText);
+  } catch (err: any) {
+    clearTimeout(timeoutId);
+    if (err.name === "AbortError") {
+      throw new Error("AI analysis timed out. Please try again.");
+    }
+    throw err;
   }
-
-  const geminiJson = (await geminiRes.json()) as any;
-  const rawText = geminiJson.candidates?.[0]?.content?.parts?.[0]?.text ?? "{}";
-  return parseAiJson(rawText);
 }
 
 export const analyzePrescription = createServerFn({ method: "POST" })
