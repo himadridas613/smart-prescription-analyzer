@@ -1,6 +1,11 @@
-import handler, { createServerEntry } from "@tanstack/react-start/server-entry";
+import { createServerEntry } from "@tanstack/react-start/server-entry";
+import * as serverEntry from "@tanstack/react-start/server-entry";
 import { consumeLastCapturedError } from "./lib/error-capture";
 import { renderErrorPage } from "./lib/error-page";
+
+const handler = (serverEntry.default ?? serverEntry) as {
+  fetch: (request: Request, ...args: unknown[]) => Promise<Response> | Response;
+};
 
 // h3 swallows in-handler throws into a normal 500 Response with body
 // {"unhandled":true,"message":"HTTPError"} — try/catch alone never fires for those.
@@ -29,9 +34,9 @@ function isH3SwallowedErrorBody(body: string): boolean {
 }
 
 export default createServerEntry({
-  async fetch(request, opts) {
+  async fetch(request, ...args) {
     try {
-      const response = await handler.fetch(request, opts);
+      const response = await handler.fetch(request, ...args);
       return await normalizeCatastrophicSsrResponse(response);
     } catch (error) {
       console.error(error);
